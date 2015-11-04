@@ -108,6 +108,152 @@ static char *saved_mount_point;
 static int  master_key_saved = 0;
 static struct crypt_persist_data *persist_data = NULL;
 
+static int previous_type;
+
+#ifdef CONFIG_HW_DISK_ENCRYPTION
+static int scrypt_keymaster(const char *passwd, const unsigned char *salt,
+                            unsigned char *ikey, void *params);
+static void convert_key_to_hex_ascii(const unsigned char *master_key,
+                                     unsigned int keysize, char *master_key_ascii);
+static int put_crypt_ftr_and_key(struct crypt_mnt_ftr *crypt_ftr);
+static int test_mount_hw_encrypted_fs(struct crypt_mnt_ftr* crypt_ftr,
+                                   char *passwd, char *mount_point, char *label);
+int cryptfs_changepw_hw_fde(int crypt_type, const char *currentpw,
+                                   const char *newpw);
+int cryptfs_check_passwd_hw(char *passwd);
+
+static void convert_key_to_hex_ascii_for_upgrade(const unsigned char *master_key,
+                                     unsigned int keysize, char *master_key_ascii)
+{
+    unsigned int i, a;
+    unsigned char nibble;
+
+    for (i = 0, a = 0; i < keysize; i++, a += 2) {
+        /* For each byte, write out two ascii hex digits */
+        nibble = (master_key[i] >> 4) & 0xf;
+        master_key_ascii[a] = nibble + (nibble > 9 ? 0x57 : 0x30);
+
+        nibble = master_key[i] & 0xf;
+        master_key_ascii[a + 1] = nibble + (nibble > 9 ? 0x57 : 0x30);
+    }
+
+    /* Add the null termination */
+    master_key_ascii[a] = '\0';
+}
+
+static int get_keymaster_hw_fde_passwd(const char* passwd, unsigned char* newpw,
+                                  unsigned char* salt,
+                                  const struct crypt_mnt_ftr *ftr)
+{
+    /* if newpw updated, return 0
+     * if newpw not updated return -1
+     */
+    int rc = -1;
+
+    if (should_use_keymaster()) {
+        if (scrypt_keymaster(passwd, salt, newpw, (void*)ftr)) {
+            SLOGE("scrypt failed");
+        } else {
+            rc = 0;
+        }
+    }
+
+    return rc;
+}
+
+static int verify_hw_fde_passwd(char *passwd, struct crypt_mnt_ftr* crypt_ftr)
+{
+    unsigned char newpw[32] = {0};
+    int key_index;
+    if (get_keymaster_hw_fde_passwd(passwd, newpw, crypt_ftr->salt, crypt_ftr))
+        key_index = set_hw_device_encryption_key(passwd,
+                                           (char*) crypt_ftr->crypto_type_name);
+    else
+        key_index = set_hw_device_encryption_key((const char*)newpw,
+                                           (char*) crypt_ftr->crypto_type_name);
+    return key_index;
+}
+
+static int verify_and_update_hw_fde_passwd(char *passwd,
+                                           struct crypt_mnt_ftr* crypt_ftr)
+{
+    char* new_passwd = NULL;
+    unsigned char newpw[32] = {0};
+    int key_index = -1;
+    int passwd_updated = -1;
+    int ascii_passwd_updated = (crypt_ftr->flags & CRYPT_ASCII_PASSWORD_UPDATED);
+
+    key_index = verify_hw_fde_passwd(passwd, crypt_ftr);
+    if (ascii_passwd_updated) {
+        SLOGI("Ascii password was updated");
+        if (key_index < 0)
+            ++crypt_ftr->failed_decrypt_count;
+    } else if (!ascii_passwd_updated && (key_index >= 0)) {
+        crypt_ftr->flags |= CRYPT_ASCII_PASSWORD_UPDATED;
+    } else {
+        /* Code in else part would execute only once:
+         * When device is upgraded from L->M release.
+         * Once upgraded, code flow should never come here.
+         * L release passed actual password in hex, so try with hex
+         * Each nible of passwd was encoded as a byte, so allocate memory
+         * twice of password len plus one more byte for null termination
+         */
+        if (crypt_ftr->crypt_type == CRYPT_TYPE_DEFAULT) {
+             new_passwd = (char*)malloc(strlen(DEFAULT_HEX_PASSWORD) + 1);
+             if (new_passwd == NULL) {
+                SLOGE("System out of memory. Password verification  incomplete");
+                goto out;
+             }
+             strlcpy(new_passwd, DEFAULT_HEX_PASSWORD, strlen(DEFAULT_HEX_PASSWORD) + 1);
+        } else {
+             new_passwd = (char*)malloc(strlen(passwd) * 2 + 1);
+             if (new_passwd == NULL) {
+                SLOGE("System out of memory. Password verification  incomplete");
+                goto out;
+             }
+             convert_key_to_hex_ascii_for_upgrade((const unsigned char*)passwd,
+                                    strlen(passwd), new_passwd);
+        }
+        key_index = set_hw_device_encryption_key((const char*)new_passwd,
+                                    (char*) crypt_ftr->crypto_type_name);
+        if (key_index >=0) {
+            crypt_ftr->failed_decrypt_count = 0;
+            SLOGI("Hex password verified...will try to update with Ascii value");
+            /* Before updating password, tie that with keymaster to tie with ROT */
+
+            if (get_keymaster_hw_fde_passwd(passwd, newpw,
+                                           crypt_ftr->salt, crypt_ftr)) {
+                passwd_updated = update_hw_device_encryption_key(new_passwd,
+                                     passwd, (char*)crypt_ftr->crypto_type_name);
+            } else {
+                passwd_updated = update_hw_device_encryption_key(new_passwd,
+                                    (const char*)newpw, (char*)crypt_ftr->crypto_type_name);
+            }
+
+            if (passwd_updated >= 0) {
+                crypt_ftr->flags |= CRYPT_ASCII_PASSWORD_UPDATED;
+                SLOGI("Ascii password recorded and updated");
+            } else {
+                SLOGI("Passwd verified, could not update...Will try next time");
+            }
+        } else {
+                ++crypt_ftr->failed_decrypt_count;
+        }
+        free(new_passwd);
+     }
+out:
+    // update footer before leaving
+    put_crypt_ftr_and_key(crypt_ftr);
+    return key_index;
+}
+#endif
+
+#ifdef MINIVOLD
+inline int release_wake_lock(const char* id) { return 0; }
+inline int acquire_wake_lock(int lock, const char* id) { return 0; }
+#endif
+
+#ifndef MINIVOLD // no HALs in recovery...
 static int keymaster_init(keymaster0_device_t **keymaster0_dev,
                           keymaster1_device_t **keymaster1_dev)
 {
@@ -146,10 +292,14 @@ err:
     *keymaster1_dev = NULL;
     return rc;
 }
+#endif
 
 /* Should we use keymaster? */
 static int keymaster_check_compatibility()
 {
+#ifdef MINIVOLD
+    return -1;
+#else
     keymaster0_device_t *keymaster0_dev = 0;
     keymaster1_device_t *keymaster1_dev = 0;
     int rc = 0;
@@ -191,11 +341,15 @@ out:
         keymaster0_close(keymaster0_dev);
     }
     return rc;
+#endif
 }
 
 /* Create a new keymaster key and store it in this footer */
 static int keymaster_create_key(struct crypt_mnt_ftr *ftr)
 {
+#ifdef MINIVOLD // no HALs in recovery...
+    return -1;
+#else
     uint8_t* key = 0;
     keymaster0_device_t *keymaster0_dev = 0;
     keymaster1_device_t *keymaster1_dev = 0;
@@ -283,6 +437,7 @@ out:
         keymaster1_close(keymaster1_dev);
     free(key);
     return rc;
+#endif
 }
 
 /* This signs the given object using the keymaster key. */
@@ -292,6 +447,9 @@ static int keymaster_sign_object(struct crypt_mnt_ftr *ftr,
                                  unsigned char **signature,
                                  size_t *signature_size)
 {
+#ifdef MINIVOLD // no HALs in recovery...
+    return -1;
+#else
     int rc = 0;
     keymaster0_device_t *keymaster0_dev = 0;
     keymaster1_device_t *keymaster1_dev = 0;
@@ -417,6 +575,7 @@ static int keymaster_sign_object(struct crypt_mnt_ftr *ftr,
             keymaster0_close(keymaster0_dev);
 
         return rc;
+#endif
 }
 
 /* Store password when userdata is successfully decrypted and mounted.
